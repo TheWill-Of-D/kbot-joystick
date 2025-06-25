@@ -35,12 +35,12 @@ ZEROS: list[tuple[str, float, float]] = [
     ("dof_right_hip_pitch_04", math.radians(-20.0), 0.01),
     ("dof_right_hip_roll_03", math.radians(-0.0), 1.0),
     ("dof_right_hip_yaw_03", 0.0, 2.0),
-    ("dof_right_knee_04", math.radians(-50.0), 0.01),
+    ("dof_right_knee_04", math.radians(-50.0), 0.003),
     ("dof_right_ankle_02", math.radians(30.0), 1.0),
     ("dof_left_hip_pitch_04", math.radians(20.0), 0.01),
     ("dof_left_hip_roll_03", math.radians(0.0), 2.0),
     ("dof_left_hip_yaw_03", 0.0, 2.0),
-    ("dof_left_knee_04", math.radians(50.0), 0.01),
+    ("dof_left_knee_04", math.radians(50.0), 0.003),
     ("dof_left_ankle_02", math.radians(-30.0), 1.0),
 ]
 
@@ -72,7 +72,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
     )
     # Optimizer parameters.
     learning_rate: float = xax.field(
-        value=3e-4,
+        value=5e-4,
         help="Learning rate for PPO.",
     )
     adam_weight_decay: float = xax.field(
@@ -119,6 +119,111 @@ def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bo
 
     # Normalize result
     return result / (jnp.linalg.norm(result, axis=-1, keepdims=True) + eps)
+
+@attrs.define(frozen=True, kw_only=True)
+class CenterOfMassPositionObservation(ksim.Observation):
+    """Observes the center of mass position of the robot's base."""
+
+    def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
+        # data.xipos contains the center of mass position for each body.
+        # The first body (index 0) is the world, so we use index 1 for the robot's base.
+        com_pos = state.physics_state.data.xipos[1]
+        return com_pos
+
+@attrs.define(frozen=True, kw_only=True)
+class CoordinatedArmLegReward(ksim.Reward):
+    """Encourages anti-phase arm-leg coordination."""
+
+    right_arm_idx: int
+    left_leg_idx: int
+    left_arm_idx: int
+    right_leg_idx: int
+
+    @classmethod
+    def create(cls, physics_model: ksim.PhysicsModel, scale: float = 0.15) -> Self:
+        all_joint_names = [j[0] for j in ZEROS]
+        joint_map = {name: i for i, name in enumerate(all_joint_names)}
+
+        return cls(
+            right_arm_idx=joint_map["dof_right_shoulder_pitch_03"],
+            left_leg_idx=joint_map["dof_left_hip_pitch_04"],
+            left_arm_idx=joint_map["dof_left_shoulder_pitch_03"],
+            right_leg_idx=joint_map["dof_right_hip_pitch_04"],
+            scale=scale,
+        )
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        joint_vel = trajectory.obs["joint_velocity_observation"]
+
+        # Extract pitch velocities for shoulders and hips
+        right_arm_vel = joint_vel[:, self.right_arm_idx]
+        left_leg_vel = joint_vel[:, self.left_leg_idx]
+        left_arm_vel = joint_vel[:, self.left_arm_idx]
+        right_leg_vel = joint_vel[:, self.right_leg_idx]
+
+        # Reward negative correlation (opposite directions)
+        reward_right_left = -right_arm_vel * left_leg_vel
+        reward_left_right = -left_arm_vel * right_leg_vel
+
+        total_reward = reward_right_left + reward_left_right
+
+        # Only apply reward when walking forward
+        is_walking_fwd = trajectory.command["unified_command"][:, 0] > 0.2
+        return jnp.where(is_walking_fwd, total_reward, 0.0)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class ZMPStabilityReward(ksim.Reward):
+    """Keeps Center of Mass over the support polygon, a proxy for ZMP stability."""
+
+    error_scale: float = 0.1
+    left_foot_idx: int
+    right_foot_idx: int
+
+    @classmethod
+    def create(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = 0.2,
+        error_scale: float = 0.1,
+    ) -> Self:
+        left_foot_idx = ksim.get_body_data_idx_from_name(physics_model, "KB_D_501L_L_LEG_FOOT")
+        right_foot_idx = ksim.get_body_data_idx_from_name(physics_model, "KB_D_501R_R_LEG_FOOT")
+
+        return cls(
+            left_foot_idx=left_foot_idx,
+            right_foot_idx=right_foot_idx,
+            scale=scale,
+            error_scale=error_scale,
+        )
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Get horizontal CoM position
+        com_pos_xy = trajectory.obs["center_of_mass_position_observation"][:, :2]
+
+        # Get feet positions from the full physics state
+        left_foot_pos_xy = trajectory.xpos[:, self.left_foot_idx, :2]
+        right_foot_pos_xy = trajectory.xpos[:, self.right_foot_idx, :2]
+
+        # Get foot contact states
+        left_contact = trajectory.obs["sensor_observation_left_foot_touch"].squeeze() > 0.1
+        right_contact = trajectory.obs["sensor_observation_right_foot_touch"].squeeze() > 0.1
+        both_contact = jnp.logical_and(left_contact, right_contact)
+        any_contact = jnp.logical_or(left_contact, right_contact)
+
+        # Calculate the center of the support polygon
+        support_center_xy = (
+            (left_foot_pos_xy + right_foot_pos_xy) / 2 * both_contact[..., None]
+            + left_foot_pos_xy * jnp.logical_and(left_contact, ~both_contact)[..., None]
+            + right_foot_pos_xy * jnp.logical_and(right_contact, ~both_contact)[..., None]
+        )
+
+        # Calculate the horizontal distance from CoM to the support center
+        distance = jnp.linalg.norm(com_pos_xy - support_center_xy, axis=-1)
+        reward = jnp.exp(-distance / self.error_scale)
+
+        # Only apply the reward when there is ground contact
+        return jnp.where(any_contact, reward, 0.0)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -179,6 +284,21 @@ class SingleFootContactReward(ksim.StatefulReward):
         is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
         reward = jnp.where(is_zero_cmd, 1.0, single_contact_grace.squeeze())
         return reward, carry
+
+
+class StandingReward(ksim.Reward):
+    """Reward for having both feet in contact with the ground."""
+
+    scale: float = 1.0
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
+        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
+        double = jnp.logical_and(left_contact, right_contact).squeeze()
+
+        is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
+        reward = jnp.where(is_zero_cmd, double, 0.0)
+        return reward
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -266,41 +386,66 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
 
 
 @attrs.define(frozen=True, kw_only=True)
-class ArmPositionReward(JointPositionPenalty):
-    error_scale: float = attrs.field(default=0.1)
+class BentElbowReward(ksim.Reward):
+    """Rewards keeping the elbows bent to a target angle."""
+
+    error_scale: float
+    joint_indices: tuple[int, ...]
+    joint_targets: tuple[float, ...]
 
     @classmethod
-    def create_reward(
+    def create(
         cls,
         physics_model: ksim.PhysicsModel,
-        scale: float = 0.05,
+        scale: float = 0.1,
         error_scale: float = 0.1,
-        scale_by_curriculum: bool = False,
     ) -> Self:
-        reward = cls.create_from_names(
-            names=[
-                "dof_right_shoulder_pitch_03",
-                "dof_right_shoulder_roll_03",
-                "dof_right_shoulder_yaw_02",
-                "dof_right_elbow_02",
-                "dof_right_wrist_00",
-                "dof_left_shoulder_pitch_03",
-                "dof_left_shoulder_roll_03",
-                "dof_left_shoulder_yaw_02",
-                "dof_left_elbow_02",
-                "dof_left_wrist_00",
-            ],
-            physics_model=physics_model,
-            scale=scale,
-            scale_by_curriculum=scale_by_curriculum,
+        names = ("dof_right_elbow_02", "dof_left_elbow_02")
+        zeros = {k: v for k, v, _ in ZEROS}
+        joint_targets = tuple(zeros[name] for name in names)
+
+        all_joint_names = [j[0] for j in ZEROS]
+        joint_indices_in_obs = tuple(all_joint_names.index(name) for name in names)
+
+        return cls(
+            joint_indices=joint_indices_in_obs,
+            joint_targets=joint_targets,
             error_scale=error_scale,
+            scale=scale,
+            scale_by_curriculum=False,  # Not used in this custom reward
         )
-        return reward
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
-        error = super().get_reward(trajectory)
+        # Use the "joint_position_observation" which is cleaner and safer
+        qpos = trajectory.obs["joint_position_observation"]
+        joint_pos = qpos[:, self.joint_indices]
+
+        deviation = joint_pos - jnp.array(self.joint_targets)
+        error = jnp.sum(jnp.square(deviation), axis=-1)
+
         reward = jnp.exp(-error / self.error_scale)
+
         return reward
+
+
+@attrs.define(frozen=True, kw_only=True)
+class TorsoAngularMomentumPenalty(ksim.Reward):
+    """Penalises torso angular momentum to encourage stability."""
+
+    scale: float = -0.1  # A negative scale makes it a penalty
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Get the base angular velocity from observations
+        ang_vel = trajectory.obs["base_angular_velocity_observation"]
+
+        # We primarily want to penalize roll and pitch velocities for stability
+        roll_pitch_ang_vel = ang_vel[:, :2]
+
+        # Calculate the squared L2 norm of the roll and pitch velocities
+        # Squaring the norm penalizes larger velocities more significantly
+        error = jnp.sum(jnp.square(roll_pitch_ang_vel), axis=-1)
+
+        return self.scale * error
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -765,7 +910,7 @@ class UnifiedCommand(ksim.Command):
         rotate_cmd = jnp.concatenate([_, _, wz, bh, _, _])
         omni_cmd = jnp.concatenate([vx, vy, wz, bh, _, _])
         stand_bend_cmd = jnp.concatenate([_, _, _, bhs, rx, ry])
-        stand_cmd = jnp.concatenate([_, _, _, bhs, _, _])
+        stand_cmd = jnp.concatenate([_, _, _, _, _, _])
 
         # randomly select a mode
         mode = jax.random.randint(rng_a, (), minval=0, maxval=6)  # 0 1 2 3 4s 5s -- 2/6 standing
@@ -1051,14 +1196,14 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         return [
             ksim.PushEvent(
-                x_linvel=0.5,
-                y_linvel=0.5,
-                z_linvel=0.3,
-                vel_range=(0.2, 0.8),
-                x_angvel=0.0,  # 0.4
+                x_linvel=0.0,
+                y_linvel=0.0,
+                z_linvel=0.0,
+                x_angvel=0.0,
                 y_angvel=0.0,
                 z_angvel=0.0,
-                interval_range=(4.0, 6.0),
+                vel_range=(0.0, 0.0),
+                interval_range=(3.0, 6.0),
             ),
         ]
 
@@ -1082,6 +1227,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.BaseLinearAccelerationObservation(),
             ksim.BaseAngularAccelerationObservation(),
             ksim.ActuatorAccelerationObservation(),
+            CenterOfMassPositionObservation(),  # Added for ZMP Stability Reward
             ksim.SensorObservation.create(
                 physics_model=physics_model,
                 sensor_name="imu_gyro",
@@ -1129,18 +1275,18 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             # cmd
             LinearVelocityTrackingReward(scale=0.3, error_scale=0.05),
             AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
-            XYOrientationReward(scale=0.1, error_scale=0.01),
+            XYOrientationReward(scale=0.2, error_scale=0.01),
             BaseHeightReward(scale=0.05, error_scale=0.05, standard_height=0.98),
             # shaping
-            # SimpleSingleFootContactReward(scale=0.15),
-            SingleFootContactReward(scale=0.5, ctrl_dt=self.config.ctrl_dt, grace_period=0.1),
-            FeetAirtimeReward(scale=0.8, ctrl_dt=self.config.ctrl_dt, touchdown_penalty=0.4),
+            SingleFootContactReward(scale=0.35, ctrl_dt=self.config.ctrl_dt, grace_period=0.1),
+            FeetAirtimeReward(scale=0.35, ctrl_dt=self.config.ctrl_dt, touchdown_penalty=0.4),
             FeetOrientationReward(scale=0.05, error_scale=0.02),
-            ArmPositionReward.create_reward(physics_model, scale=0.05, error_scale=0.05),
-            # FeetPositionReward(scale=0.1, error_scale=0.05, stance_width=0.3),
+            BentElbowReward.create(physics_model, scale=0.03, error_scale=0.1),
+            TorsoAngularMomentumPenalty(scale=-0.05),
+            # CoordinatedArmLegReward.create(physics_model, scale=0.001),
+            ZMPStabilityReward.create(physics_model, scale=0.005, error_scale=0.3),
             # sim2real
             ActionVelocityReward(scale=0.01, error_scale=0.02, norm="l1"),
-            # ksim.CtrlPenalty(scale=-0.00001),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -1189,6 +1335,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             + 3  # base angular vel
             + num_joints  # actuator force
             + 1  # base height
+            + 3 # center of mass position
         )
 
         return Model(
@@ -1260,6 +1407,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         base_ang_vel_3 = observations["base_angular_velocity_observation"]
         actuator_force_n = observations["actuator_force_observation"]
         base_height = observations["base_height_observation"]
+        com_pos_3 = observations["center_of_mass_position_observation"]
 
         obs_n = jnp.concatenate(
             [
@@ -1283,6 +1431,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 base_ang_vel_3,
                 actuator_force_n / 4.0,
                 base_height,
+                com_pos_3,
             ],
             axis=-1,
         )
@@ -1396,9 +1545,9 @@ if __name__ == "__main__":
             render_track_body_id=0,
             render_markers=True,
             render_full_every_n_seconds=0,
-            render_length_seconds=10,
+            render_length_seconds=20,
             max_values_per_plot=50,
             # Checkpointing parameters.
-            save_every_n_seconds=60,
+            save_every_n_seconds=120,
         ),
     )
