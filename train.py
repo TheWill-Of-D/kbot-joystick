@@ -22,13 +22,13 @@ from jaxtyping import Array, PRNGKeyArray, PyTree
 # These are in the order of the neural network outputs.
 # Joint name, target position, penalty weight.
 ZEROS: list[tuple[str, float, float]] = [
-    ("dof_right_shoulder_pitch_03", 0.0, 1.0),
-    ("dof_right_shoulder_roll_03", math.radians(-10.0), 1.0),
+    ("dof_right_shoulder_pitch_03", 0.0, 0.003),
+    ("dof_right_shoulder_roll_03", math.radians(-10.0), 0.003),
     ("dof_right_shoulder_yaw_02", 0.0, 1.0),
     ("dof_right_elbow_02", math.radians(90.0), 1.0),
     ("dof_right_wrist_00", 0.0, 1.0),
-    ("dof_left_shoulder_pitch_03", 0.0, 1.0),
-    ("dof_left_shoulder_roll_03", math.radians(10.0), 1.0),
+    ("dof_left_shoulder_pitch_03", 0.0, 0.003),
+    ("dof_left_shoulder_roll_03", math.radians(10.0), 0.003),
     ("dof_left_shoulder_yaw_02", 0.0, 1.0),
     ("dof_left_elbow_02", math.radians(-90.0), 1.0),
     ("dof_left_wrist_00", 0.0, 1.0),
@@ -282,23 +282,43 @@ class SingleFootContactReward(ksim.StatefulReward):
         carry, time_since_single_contact = jax.lax.scan(_body, reward_carry, single)
         single_contact_grace = time_since_single_contact < self.grace_period
         is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
-        reward = jnp.where(is_zero_cmd, 1.0, single_contact_grace.squeeze())
+        reward = jnp.where(is_zero_cmd, 0.0, single_contact_grace.squeeze())
         return reward, carry
 
 
-class StandingReward(ksim.Reward):
-    """Reward for having both feet in contact with the ground."""
-
-    scale: float = 1.0
+@attrs.define(frozen=True, kw_only=True)
+class StandingStillnessReward(ksim.Reward):
+    """Rewards double foot contact AND low base velocity when commanded to stand."""
+    scale: float = 1.0 # This will be set when the reward is instantiated
+    velocity_error_scale: float = 0.01 
+    max_reward_for_velocity: float = 1.0 # Max component of reward from low velocity
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
         left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
         right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
-        double = jnp.logical_and(left_contact, right_contact).squeeze()
-
+        double_contact = jnp.logical_and(left_contact, right_contact)
         is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
-        reward = jnp.where(is_zero_cmd, double, 0.0)
-        return reward
+        base_lin_vel_xy = traj.obs["base_linear_velocity_observation"][:, :2]
+        lin_vel_mag_sq = jnp.sum(jnp.square(base_lin_vel_xy), axis=-1)
+        base_ang_vel_z = traj.obs["base_angular_velocity_observation"][:, 2]
+        ang_vel_mag_sq = jnp.square(base_ang_vel_z)
+        velocity_reward_component = self.max_reward_for_velocity * jnp.exp(-(lin_vel_mag_sq + ang_vel_mag_sq) / self.velocity_error_scale)
+        standing_condition_met = jnp.where(double_contact, velocity_reward_component, 0.0)
+        return jnp.where(is_zero_cmd, standing_condition_met, 0.0)
+
+@attrs.define(frozen=True, kw_only=True)
+class StandStillJointVelocityPenalty(ksim.Reward):
+    """Penalizes non-zero joint velocities when commanded to stand."""
+    scale: float = -0.1 # Negative for penalty
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        is_zero_cmd = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < 1e-3
+        joint_vel = trajectory.obs["joint_velocity_observation"]
+        vel_magnitude_sq_sum = jnp.sum(jnp.square(joint_vel), axis=-1)
+        
+        cost = vel_magnitude_sq_sum
+        
+        return jnp.where(is_zero_cmd, self.scale * cost, 0.0)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -1277,14 +1297,20 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
             XYOrientationReward(scale=0.2, error_scale=0.01),
             BaseHeightReward(scale=0.05, error_scale=0.05, standard_height=0.98),
-            # shaping
-            SingleFootContactReward(scale=0.35, ctrl_dt=self.config.ctrl_dt, grace_period=0.1),
-            FeetAirtimeReward(scale=0.35, ctrl_dt=self.config.ctrl_dt, touchdown_penalty=0.4),
-            FeetOrientationReward(scale=0.05, error_scale=0.02),
-            BentElbowReward.create(physics_model, scale=0.03, error_scale=0.1),
+            #Standing
+            StandingStillnessReward(scale=1.5,velocity_error_scale=0.005,max_reward_for_velocity=1.0), # to test
+            # FeetPositionReward(scale=0.3, error_scale=0.1, stance_width=0.3), 
+            StandStillJointVelocityPenalty(scale=-0.02), # to test
+            # Stability 
+            ZMPStabilityReward.create(physics_model, scale=0.05, error_scale=0.3),
             TorsoAngularMomentumPenalty(scale=-0.05),
-            # CoordinatedArmLegReward.create(physics_model, scale=0.001),
-            ZMPStabilityReward.create(physics_model, scale=0.005, error_scale=0.3),
+            # shaping 
+            SingleFootContactReward(scale=0.35, ctrl_dt=self.config.ctrl_dt, grace_period=0.1), # review, velocity dependance of grace period
+            FeetAirtimeReward(scale=0.35, ctrl_dt=self.config.ctrl_dt, touchdown_penalty=0.4), # review, velocity dependance, both of these rewards are not sound in terms of physics.
+            FeetOrientationReward(scale=0.05, error_scale=0.02),
+            # BentElbowReward.create(physics_model, scale=0.005, error_scale=0.1), # um why is this here again, isnt this included in the body postion reward?
+            CoordinatedArmLegReward.create(physics_model, scale=0.0025),
+            
             # sim2real
             ActionVelocityReward(scale=0.01, error_scale=0.02, norm="l1"),
         ]
